@@ -3,6 +3,51 @@
 <br>
 <br>
 
+## My Experimentation Plan
+
+This fork documents personal experiments aimed at improving model performance on the FineWeb validation dataset. All experiments strictly follow the **official challenge procedure** — same 10-minute training wall-clock cap, same ≤16MB artifact size limit, same tokenizer-agnostic bits-per-byte evaluation metric — with one key hardware difference:
+
+> **Hardware: 8 × A100 (40 GB SXM) GPUs** instead of the official 8 × H100 SXM GPUs.
+
+### Constraints & Alignment with Official Rules
+
+| Constraint | Official | This Repo |
+|---|---|---|
+| Max training time | 10 min on 8×H100 | 10 min on **8×A100** |
+| Model artifact size | ≤ 16 MB | ≤ 16 MB |
+| Parameter count (fp32 equiv.) | ≤ 16 M | ≤ 16 M |
+| Evaluation metric | val BPB (FineWeb) | val BPB (FineWeb) |
+| Evaluation procedure | Same as training script | Same as training script |
+| External downloads during eval | ❌ Not allowed | ❌ Not allowed |
+
+Because A100s have lower peak FP16/BF16 throughput and different NVLink bandwidth than H100 SXMs, **absolute scores and baseline numbers will be lower than the official leaderboard**. All comparisons are therefore made *within this repo* — each experiment is compared against the A100 re-run of the provided starter baseline (Naive Baseline, `records/track_10min_16mb/2026-03-17_NaiveBaseline`).
+
+### Goals
+
+1. Reproduce the starter baseline on 8×A100 to establish a reference BPB score.
+2. Incrementally test ideas (architecture changes, quantization, training tricks, etc.) and measure improvements over the A100 baseline.
+3. Keep each experiment in its own dated folder under `records/` following the existing convention.
+4. Clearly note "8×A100" in every `submission.json` and README so scores are not confused with official H100 results.
+
+### Running the Baseline on 8×A100
+
+```bash
+# Download data (sp1024 vocab)
+python3 data/cached_challenge_fineweb.py --variant sp1024
+
+# Launch baseline — 8 GPUs
+RUN_ID=baseline_a100 \
+DATA_PATH=./data/datasets/fineweb10B_sp1024/ \
+TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model \
+VOCAB_SIZE=1024 \
+torchrun --standalone --nproc_per_node=8 train_gpt.py
+```
+
+> Expected result: val BPB ≈ 1.22–1.23 on 8×A100 (vs. ~1.2244 on 8×H100).  
+> Exact numbers will be updated once the baseline run completes.
+
+---
+
 **OpenAI Model Craft Challenge: Parameter Golf** is a challenge to train the best language model that fits in a 16MB artifact and trains in under 10 minutes on 8xH100s, evaluated by compression on the FineWeb validation set (tokenizer-agnostic, bits per byte).
 
 This challenge is heavily inspired by the [NanoGPT Speedrunning](https://github.com/KellerJordan/modded-nanogpt) challenge, where participants compete to train a model that reaches 3.28 FineWeb validation loss as quickly as possible. We're excited to see how optimizing for a parameter-constrained setting pushes people toward unique architectures (test-time compute, aggressive parameter tying, depth recurrence, low-rank training, ...), compression schemes (low precision, QAT, bitnets, novel tokenizers, ...), and other creative submissions (test-time training, long context, megakernels ...). 
