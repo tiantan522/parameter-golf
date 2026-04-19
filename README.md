@@ -79,6 +79,40 @@ NCCL_NET_PLUGIN=none \
 
 GNS defaults (when `MUON_NS_ALGORITHM=gram`): YOU coefficients, `adjust_lr=none`, `weight_decay=0.1`.
 
+### Depth Recurrence Experiments
+
+Added depth recurrence: repeating middle layers for free virtual depth with zero extra parameters. E.g., `RECUR_LAYERS="3,4"` with 9 physical layers creates 11 virtual layers — blocks 3 and 4 each execute twice per forward pass.
+
+**Key findings:**
+- Depth recurrence improves quality by ~0.003-0.004 BPB at the cost of slower steps (~35% overhead per step for 2-layer recurrence).
+- Always-on recurrence (`RECUR_START_FRAC=0.0`) works reliably. Mid-training activation is constrained by `torch.compile(fullgraph=True)` which caches the computation graph — dual-mode warmup is implemented but graph switching remains fragile.
+- Layers 3,4 are the sweet spot for our 9-layer model, near the U-Net encoder/decoder hinge point (matching leaderboard findings for 11-layer models with layers 4,5).
+
+| Config | val_bpb | step_avg | steps | Δ vs GNS+MLP4x |
+|---|---|---|---|---|
+| GNS + MLP=4x (baseline) | 1.2269 | ~110ms | ~6000 | — |
+| **GNS + MLP=4x + RECUR 3,4** | **1.2232** | 135ms | 4439 | **−0.0037** ✅ |
+
+**Best command (with depth recurrence):**
+```bash
+NCCL_NET_PLUGIN=none \
+  RECUR_LAYERS="3,4" RECUR_START_FRAC=0.0 \
+  MUON_NS_ALGORITHM=gram MLP_MULT=4 \
+  RUN_ID=gns_mlp4x_recur34 \
+  DATA_PATH=./data/datasets/fineweb10B_sp1024/ \
+  TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model \
+  VOCAB_SIZE=1024 \
+  torchrun --standalone --nproc_per_node=8 train_gpt.py
+```
+
+**Cumulative progress (8×A100):**
+
+| Step | Config | val_bpb | Δ vs baseline |
+|---|---|---|---|
+| 1 | Standard Muon baseline (9L, mlp=2x) | 1.2378 | — |
+| 2 | + GNS + MLP=4x + WD=0.1 | 1.2269 | −0.0109 |
+| 3 | + Depth Recurrence (layers 3,4) | **1.2232** | **−0.0146** |
+
 ---
 
 **OpenAI Model Craft Challenge: Parameter Golf** is a challenge to train the best language model that fits in a 16MB artifact and trains in under 10 minutes on 8xH100s, evaluated by compression on the FineWeb validation set (tokenizer-agnostic, bits per byte).

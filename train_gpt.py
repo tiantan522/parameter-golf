@@ -70,6 +70,11 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
+    # Depth recurrence: repeat specified layers for free virtual depth.
+    # E.g. RECUR_LAYERS="3,4" repeats layers 3,4 creating 11 virtual layers from 9 physical.
+    recur_layers = os.environ.get("RECUR_LAYERS", "").strip()
+    recur_start_frac = float(os.environ.get("RECUR_START_FRAC", "0.5"))
+
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
@@ -885,6 +890,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        recur_layers: list[int] | None = None,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -892,11 +898,41 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.num_physical_layers = num_layers
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
+
+        # Depth recurrence: build virtual-to-physical layer mappings.
+        # recur_layers lists physical layer indices to repeat once after their
+        # first occurrence.  E.g. recur_layers=[3,4] with 9 physical layers
+        # yields v2p_recur = [0,1,2,3,4, 3,4, 5,6,7,8] (11 virtual layers).
+        self.recur_layer_indices = sorted(set(recur_layers or []))
+        for rl in self.recur_layer_indices:
+            if not 0 <= rl < num_layers:
+                raise ValueError(f"recur layer {rl} out of range [0, {num_layers})")
+        if self.recur_layer_indices:
+            cutoff = max(self.recur_layer_indices) + 1
+            self._v2p_recur = list(range(cutoff)) + self.recur_layer_indices + list(range(cutoff, num_layers))
+        else:
+            self._v2p_recur = list(range(num_layers))
+        self._v2p_no_recur = list(range(num_layers))
+
+        # U-Net encoder/decoder split for both modes.
+        n_virt = len(self._v2p_recur)
+        self._enc_recur = n_virt // 2
+        self._dec_recur = n_virt - self._enc_recur
+        self._enc_no_recur = num_layers // 2
+        self._dec_no_recur = num_layers - self._enc_no_recur
+
+        # Start in non-recurrent mode; skip_weights sized for the larger (recurrent) mode.
+        self.num_skip_weights = min(self._enc_recur, self._dec_recur)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+
+        # The actual state: default to non-recurrent.
+        self._recurrence_active = False
+        self.v2p = self._v2p_no_recur
+        self.num_encoder_layers = self._enc_no_recur
+        self.num_decoder_layers = self._dec_no_recur
+
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -916,6 +952,18 @@ class GPT(nn.Module):
             self.lm_head._zero_init = True
         self._init_weights()
 
+    def set_recurrence_active(self, active: bool) -> None:
+        """Toggle depth recurrence on/off. Adjusts v2p and encoder/decoder split."""
+        self._recurrence_active = bool(active) and bool(self.recur_layer_indices)
+        if self._recurrence_active:
+            self.v2p = self._v2p_recur
+            self.num_encoder_layers = self._enc_recur
+            self.num_decoder_layers = self._dec_recur
+        else:
+            self.v2p = self._v2p_no_recur
+            self.num_encoder_layers = self._enc_no_recur
+            self.num_decoder_layers = self._dec_no_recur
+
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
@@ -928,15 +976,18 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
+        v2p = self.v2p
 
         # First half stores skips; second half reuses them in reverse order.
+        # v2p maps virtual layer indices to physical Block indices, enabling
+        # depth recurrence (some physical blocks run more than once).
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self.blocks[v2p[i]](x, x0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x = self.blocks[v2p[self.num_encoder_layers + i]](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -1052,6 +1103,11 @@ def main() -> None:
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
 
+    # Parse depth recurrence layer list from comma-separated string.
+    recur_layers: list[int] = []
+    if args.recur_layers:
+        recur_layers = sorted(set(int(x.strip()) for x in args.recur_layers.split(",") if x.strip()))
+
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
@@ -1064,6 +1120,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        recur_layers=recur_layers,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1164,6 +1221,14 @@ def main() -> None:
         )
     else:
         log0(f"muon_ns:standard backend_steps:{args.muon_backend_steps}")
+    if recur_layers:
+        log0(
+            f"depth_recurrence:layers={recur_layers} start_frac={args.recur_start_frac} "
+            f"v2p_recur={base_model._v2p_recur} virtual_layers={len(base_model._v2p_recur)} "
+            f"physical_layers={base_model.num_physical_layers}"
+        )
+    else:
+        log0("depth_recurrence:disabled")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1190,24 +1255,40 @@ def main() -> None:
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
+    # When depth recurrence is configured, we warmup BOTH modes (non-recur and recur)
+    # so torch.compile caches both graph variants. This is critical for mid-training
+    # activation — without it, the compiled graph ignores the v2p/encoder/decoder changes.
     if args.warmup_steps > 0:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
-        model.train()
-        for warmup_step in range(args.warmup_steps):
-            zero_grad_all()
-            for micro_step in range(grad_accum_steps):
-                if distributed:
-                    model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-                x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_loss = model(x, y)
-                (warmup_loss * grad_scale).backward()
-            for opt in optimizers:
-                opt.step()
-            zero_grad_all()
-            if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
-                log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+
+        def _run_warmup(label: str, n_steps: int) -> None:
+            model.train()
+            for warmup_step in range(n_steps):
+                zero_grad_all()
+                for micro_step in range(grad_accum_steps):
+                    if distributed:
+                        model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+                    x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                        warmup_loss = model(x, y)
+                    (warmup_loss * grad_scale).backward()
+                for opt in optimizers:
+                    opt.step()
+                zero_grad_all()
+                if n_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == n_steps:
+                    log0(f"warmup_step:{warmup_step + 1}/{n_steps} ({label})")
+
+        # Phase 1: warmup non-recur mode (default)
+        base_model.set_recurrence_active(False)
+        _run_warmup("base", args.warmup_steps)
+        # Phase 2: if recurrence configured, also warmup recur mode to cache its compiled graph
+        if recur_layers:
+            base_model.set_recurrence_active(True)
+            _run_warmup("recur", args.warmup_steps)
+            base_model.set_recurrence_active(False)
+            log0(f"warmup:both_modes_primed virtual_layers_recur={len(base_model._v2p_recur)}")
+
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
@@ -1259,6 +1340,19 @@ def main() -> None:
                     f"step:{step}/{args.iterations}"
                 )
             break
+
+        # Activate depth recurrence mid-training (wallclock-based).
+        # Training the cheaper non-recurrent model first, then switching to recurrent
+        # mode avoids the initial loss spike and lets us train more steps cheaply.
+        if recur_layers and not base_model._recurrence_active:
+            elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+            frac_elapsed = elapsed_ms / max_wallclock_ms if max_wallclock_ms else step / max(args.iterations, 1)
+            if frac_elapsed >= args.recur_start_frac:
+                base_model.set_recurrence_active(True)
+                log0(
+                    f"depth_recurrence:activated step:{step} frac:{frac_elapsed:.3f} "
+                    f"virtual_layers:{len(base_model.v2p)} v2p={base_model.v2p}"
+                )
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
