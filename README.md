@@ -113,6 +113,39 @@ NCCL_NET_PLUGIN=none \
 | 2 | + GNS + MLP=4x + WD=0.1 | 1.2269 | −0.0109 |
 | 3 | + Depth Recurrence (layers 3,4) | **1.2232** | **−0.0146** |
 
+### Multi-Token Prediction (MTP) Experiment — Negative Result (so far)
+
+Implemented DeepSeek V3 / Nemotron 3 Super style sequential MTP as a training-only auxiliary loss. Unlike the simple extra-heads approach that previously failed in the competition (independent linear projections from the same hidden state), this implementation follows the full architecture:
+
+- **Ground-truth token feeding**: Each MTP depth receives `embed(actual_next_token)` — not just the hidden state
+- **Concat + project**: `Linear(2D, D)` on `Concat(RMSNorm(hidden), RMSNorm(embed))`
+- **Shared transformer block**: One full `Block` (attention + MLP) reused across all MTP depths
+- **Sequential chaining**: Each depth builds on the previous depth's output
+- **Zero export cost**: All MTP parameters are stripped before quantization
+
+**Result: MTP did not improve performance.**
+
+| Config | val_bpb | step_avg | steps | Artifact | Δ vs best |
+|---|---|---|---|---|---|
+| GNS + MLP=4x (no MTP) | 1.2269 | ~110ms | ~5450 | 15.8M | baseline |
+| GNS + MLP=4x + **MTP depth=1, weight=0.1** | **1.2303** | 126.6ms | 4739 | 15.8M | **+0.0034** ❌ |
+
+**Why it doesn't help at this scale:**
+1. **Step time overhead** (+15%): The shared TRM block adds one full attention+MLP forward/backward per step → 700 fewer training steps in the 10-minute budget
+2. **Small model capacity**: At 512d / 9 layers (~5M backbone params), the model lacks spare representational bandwidth to benefit from auxiliary future-prediction signals
+3. **Matches competition findings**: The ternary/binary model experiments (PR #640/641) found MTP "0.006 bpb worse — model capacity too limited for auxiliary objectives" and "MTP_HEADS=0 permanently locked"
+
+MTP is a technique that works at large scale (120B+ params in Nemotron/DeepSeek) where models have spare capacity. At parameter-golf scale, the step-time tax outweighs the richer training signal. The implementation remains in the codebase (disabled by default with `MTP_NUM_DEPTHS=0`) for reference.
+
+**Cumulative progress (8×A100):**
+
+| Step | Config | val_bpb | Δ vs baseline |
+|---|---|---|---|
+| 1 | Standard Muon baseline (9L, mlp=2x) | 1.2378 | — |
+| 2 | + GNS + MLP=4x + WD=0.1 | 1.2269 | −0.0109 |
+| 3 | + Depth Recurrence (layers 3,4) | **1.2232** | **−0.0146** |
+| 4 | + MTP depth=1 (reverted — negative) | 1.2303 | +0.0034 ❌ |
+
 ---
 
 **OpenAI Model Craft Challenge: Parameter Golf** is a challenge to train the best language model that fits in a 16MB artifact and trains in under 10 minutes on 8xH100s, evaluated by compression on the FineWeb validation set (tokenizer-agnostic, bits per byte).

@@ -75,6 +75,13 @@ class Hyperparameters:
     recur_layers = os.environ.get("RECUR_LAYERS", "").strip()
     recur_start_frac = float(os.environ.get("RECUR_START_FRAC", "0.5"))
 
+    # Multi-Token Prediction (training-only auxiliary loss, DeepSeek V3 / Nemotron 3 style).
+    # Sequential MTP modules predict future tokens using ground-truth token feeding.
+    # Each module: Concat(RMSNorm(hidden), embed(gt_token)) → projection → shared TRM block.
+    # All MTP parameters are discarded at export — zero artifact size cost.
+    mtp_num_depths = int(os.environ.get("MTP_NUM_DEPTHS", 0))
+    mtp_loss_weight = float(os.environ.get("MTP_LOSS_WEIGHT", 0.3))
+
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
@@ -876,6 +883,30 @@ class Block(nn.Module):
         return x
 
 
+# -----------------------------
+# MULTI-TOKEN PREDICTION (MTP)
+# -----------------------------
+#
+# DeepSeek V3 / Nemotron 3 Super style sequential MTP modules.
+# Each module receives backbone hidden states + ground-truth next-token embeddings,
+# projects them through a shared transformer block, and predicts future tokens.
+# All MTP modules are training-only — discarded before export (zero artifact cost).
+# Reference: DeepSeek V3 paper Section 3.3, Nemotron 3 Super 120B model card.
+
+
+class MTPProjection(nn.Module):
+    """Per-depth projection for MTP: Concat(RMSNorm(hidden), embed) → Linear(2D, D)."""
+
+    def __init__(self, model_dim: int):
+        super().__init__()
+        self.norm = RMSNorm()
+        self.proj = CastedLinear(2 * model_dim, model_dim, bias=False)
+        self.proj._zero_init = True
+
+    def forward(self, hidden: Tensor, token_embed: Tensor) -> Tensor:
+        return self.proj(torch.cat([self.norm(hidden), token_embed], dim=-1))
+
+
 class GPT(nn.Module):
     def __init__(
         self,
@@ -891,6 +922,8 @@ class GPT(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         recur_layers: list[int] | None = None,
+        mtp_num_depths: int = 0,
+        mtp_loss_weight: float = 0.3,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -950,6 +983,22 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
+
+        # MTP (Multi-Token Prediction): training-only sequential modules.
+        # Per-depth projections (unique) + one shared transformer block (reused across depths).
+        # All discarded at export — zero artifact size cost.
+        self.mtp_num_depths = mtp_num_depths
+        self.mtp_loss_weight = mtp_loss_weight
+        self.mtp_projections = nn.ModuleList(
+            [MTPProjection(model_dim) for _ in range(mtp_num_depths)]
+        )
+        self.mtp_shared_block = (
+            Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+            if mtp_num_depths > 0
+            else None
+        )
+        self.mtp_norm = RMSNorm() if mtp_num_depths > 0 else None
+
         self._init_weights()
 
     def set_recurrence_active(self, active: bool) -> None:
@@ -971,7 +1020,18 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
+    def _compute_logits(self, hidden_flat: Tensor) -> Tensor:
+        """Shared logit computation for main head and MTP heads."""
+        if self.tie_embeddings:
+            logits_proj = F.linear(hidden_flat, self.tok_emb.weight)
+        else:
+            if self.lm_head is None:
+                raise RuntimeError("lm_head is required when tie_embeddings=False")
+            logits_proj = self.lm_head(hidden_flat)
+        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        bsz, seqlen = input_ids.shape
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -989,16 +1049,45 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[v2p[self.num_encoder_layers + i]](x, x0)
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
-        targets = target_ids.reshape(-1)
-        if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
-        else:
-            if self.lm_head is None:
-                raise RuntimeError("lm_head is required when tie_embeddings=False")
-            logits_proj = self.lm_head(x)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        x_normed = self.final_norm(x)
+        main_logits = self._compute_logits(x_normed.reshape(-1, x_normed.size(-1)))
+        main_loss = F.cross_entropy(main_logits.float(), target_ids.reshape(-1), reduction="mean")
+
+        # MTP: sequential multi-token prediction (training only).
+        # Each depth k predicts token[t+k+2] given hidden[t] + embed(token[t+k+1]).
+        # Uses ground-truth token feeding → shared projection → shared TRM block → shared LM head.
+        if self.training and self.mtp_num_depths > 0 and self.mtp_loss_weight > 0:
+            mtp_loss_sum = main_loss.new_zeros(())
+            mtp_count = 0
+            prev_hidden = x_normed  # [B, T, D] — backbone output after final_norm
+            for k, mtp_proj in enumerate(self.mtp_projections):
+                # For depth k: predict target_ids[:, k+1:] from hidden[:, :-(k+1)]
+                # using ground-truth embed of target_ids[:, k:-(1 if k+1<seqlen else seqlen)]
+                shift = k + 1
+                valid_len = seqlen - shift
+                if valid_len <= 1:
+                    break
+                # Ground-truth embeddings of the token we're conditioning on
+                gt_embeds = self.tok_emb(target_ids[:, k : k + valid_len])  # [B, valid_len, D]
+                gt_embeds = F.rms_norm(gt_embeds, (gt_embeds.size(-1),))
+                h_slice = prev_hidden[:, :valid_len, :]  # [B, valid_len, D]
+                # Per-depth projection: Concat(Norm(hidden), embed) → Linear(2D, D)
+                mtp_input = mtp_proj(h_slice, gt_embeds)  # [B, valid_len, D]
+                # Shared transformer block processes the combined representation
+                mtp_hidden = self.mtp_shared_block(mtp_input, mtp_input)  # [B, valid_len, D]
+                mtp_normed = self.mtp_norm(mtp_hidden)  # type: ignore[misc]
+                # Predict the token AFTER the ground-truth token we conditioned on
+                mtp_targets = target_ids[:, shift : shift + valid_len]  # [B, valid_len]
+                mtp_logits = self._compute_logits(mtp_normed.reshape(-1, mtp_normed.size(-1)))
+                mtp_loss_sum = mtp_loss_sum + F.cross_entropy(
+                    mtp_logits.float(), mtp_targets.reshape(-1), reduction="mean"
+                )
+                mtp_count += 1
+                prev_hidden = mtp_normed  # Sequential chaining for next depth
+            if mtp_count > 0:
+                main_loss = main_loss + self.mtp_loss_weight * (mtp_loss_sum / mtp_count)
+
+        return main_loss
 
 
 # -----------------------------
@@ -1121,6 +1210,8 @@ def main() -> None:
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
         recur_layers=recur_layers,
+        mtp_num_depths=args.mtp_num_depths,
+        mtp_loss_weight=args.mtp_loss_weight,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1147,6 +1238,11 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    # MTP module params: projections + shared block + norm (training-only, use Adam with scalar_lr).
+    mtp_params: list[nn.Parameter] = []
+    for mod in [base_model.mtp_projections, base_model.mtp_shared_block, base_model.mtp_norm]:
+        if mod is not None:
+            mtp_params.extend(p for p in mod.parameters())
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1197,9 +1293,18 @@ def main() -> None:
             fused=True,
         )
         optimizers.insert(1, optimizer_head)
+    if mtp_params:
+        optimizer_mtp = torch.optim.Adam(
+            [{"params": mtp_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+        optimizers.append(optimizer_mtp)
 
     n_params = sum(p.numel() for p in base_model.parameters())
-    log0(f"model_params:{n_params}")
+    n_mtp_params = sum(p.numel() for p in mtp_params)
+    log0(f"model_params:{n_params} (backbone:{n_params - n_mtp_params} mtp_training_only:{n_mtp_params})")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
@@ -1229,6 +1334,13 @@ def main() -> None:
         )
     else:
         log0("depth_recurrence:disabled")
+    if args.mtp_num_depths > 0:
+        log0(
+            f"mtp:depths={args.mtp_num_depths} loss_weight={args.mtp_loss_weight} "
+            f"training_only_params={n_mtp_params}"
+        )
+    else:
+        log0("mtp:disabled")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1415,15 +1527,23 @@ def main() -> None:
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
 
+    # Strip MTP training-only params before export (zero artifact cost).
+    MTP_EXPORT_EXCLUDE = ("mtp_projections.", "mtp_shared_block.", "mtp_norm.")
+    full_sd = base_model.state_dict()
+    export_sd = {k: v for k, v in full_sd.items() if not any(k.startswith(p) for p in MTP_EXPORT_EXCLUDE)}
+    excluded_mtp_params = sum(v.numel() for k, v in full_sd.items() if any(k.startswith(p) for p in MTP_EXPORT_EXCLUDE))
+    if excluded_mtp_params > 0:
+        log0(f"export:excluding {excluded_mtp_params} MTP training-only params")
+
     if master_process:
-        torch.save(base_model.state_dict(), "final_model.pt")
+        torch.save(export_sd, "final_model.pt")
         model_bytes = os.path.getsize("final_model.pt")
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+    quant_obj, quant_stats = quantize_state_dict_int8(export_sd)
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
@@ -1446,7 +1566,8 @@ def main() -> None:
     with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
-    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+    # strict=False: MTP training-only params are excluded from the export artifact.
+    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=(excluded_mtp_params == 0))
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
