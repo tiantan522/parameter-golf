@@ -86,6 +86,17 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
+    # Muon Newton-Schulz algorithm selection:
+    #   "standard" = original Newton-Schulz (zeropower_via_newtonschulz5)
+    #   "gram"     = Gram Newton-Schulz from https://github.com/Dao-AILab/gram-newton-schulz
+    muon_ns_algorithm = os.environ.get("MUON_NS_ALGORITHM", "standard")
+    # Coefficient preset for GNS mode: "you" (best tested) or "polar_express"
+    muon_gns_coefficients = os.environ.get("MUON_GNS_COEFFICIENTS", "you")
+    # LR adjustment for GNS mode: "none" (best tested), "rms_norm", or "spectral_norm"
+    muon_gns_adjust_lr = os.environ.get("MUON_GNS_ADJUST_LR", "none")
+    # Weight decay for GNS Muon (decoupled); enables model compression for larger architectures
+    muon_gns_weight_decay = float(os.environ.get("MUON_GNS_WEIGHT_DECAY", 0.1))
+
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -107,6 +118,109 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
         B = b * A + c * A @ A
         X = a * X + B @ X
     return X.T if transposed else X
+
+
+# -----------------------------
+# GRAM NEWTON-SCHULZ COEFFICIENTS & ALGORITHM
+# -----------------------------
+#
+# From https://github.com/Dao-AILab/gram-newton-schulz
+# Gram Newton-Schulz iterates on the smaller Gram matrix XX^T instead of X,
+# reducing FLOPs for non-square matrices and enabling per-step tuned coefficients.
+
+# Per-step coefficients from You Jiacheng: https://x.com/YouJiacheng/status/1905861218138804534
+YOU_COEFFICIENTS = [
+    (4.0848, -6.8946, 2.9270),
+    (3.9505, -6.3029, 2.6377),
+    (3.7418, -5.5913, 2.3037),
+    (2.8769, -3.1427, 1.2046),
+    (2.8366, -3.0525, 1.2012),
+]
+
+# Polar Express coefficients from https://arxiv.org/pdf/2505.16932, with safety scaling
+_UNMODIFIED_POLAR_EXPRESS = [
+    (8.28721201814563, -23.595886519098837, 17.300387312530933),
+    (4.107059111542203, -2.9478499167379106, 0.5448431082926601),
+    (3.9486908534822946, -2.908902115962949, 0.5518191394370137),
+    (3.3184196573706015, -2.488488024314874, 0.51004894012372),
+    (2.300652019954817, -1.6689039845747493, 0.4188073119525673),
+]
+_SAFETY = 1.05
+POLAR_EXPRESS_COEFFICIENTS = [
+    (a / _SAFETY, b / _SAFETY**3, c / _SAFETY**5)
+    for (a, b, c) in _UNMODIFIED_POLAR_EXPRESS
+]
+
+GNS_COEFFICIENT_PRESETS = {
+    "you": YOU_COEFFICIENTS,
+    "polar_express": POLAR_EXPRESS_COEFFICIENTS,
+}
+
+
+def zeropower_via_gram_newton_schulz(
+    G: Tensor,
+    coefficients: list[tuple[float, float, float]],
+    restart_at: list[int] | None = None,
+    eps: float = 1e-7,
+) -> Tensor:
+    """Gram Newton-Schulz orthogonalization (pure PyTorch, no custom kernels).
+
+    For non-square matrices, iterates on the smaller Gram matrix R = XX^T,
+    with periodic restarts for numerical stability. For square matrices,
+    falls back to standard Newton-Schulz (matching official behaviour).
+
+    Reference: https://github.com/Dao-AILab/gram-newton-schulz
+    """
+    if restart_at is None:
+        restart_at = [2]  # default from GNS repo for 5-step configs
+
+    original_dtype = G.dtype
+    X = G.float()
+    transposed = G.size(0) > G.size(1)
+    if transposed:
+        X = X.T
+
+    X /= X.norm() + eps
+    X = X.half()  # fp16 for iteration speed (matching GNS reference)
+
+    is_square = X.size(0) == X.size(1)
+    if is_square:
+        # Standard Newton-Schulz: no FLOP advantage from Gram trick on square matrices.
+        for a, b, c in coefficients:
+            A = X @ X.T
+            B = b * A + c * (A @ A)
+            X = a * X + B @ X
+    else:
+        # Gram Newton-Schulz: iterate on R = XX^T (smaller than X for non-square).
+        n = X.size(0)
+        I = torch.eye(n, device=X.device, dtype=X.dtype)
+
+        R = X @ X.T
+        Q: Tensor | None = None
+
+        for i, (a, b, c) in enumerate(coefficients):
+            if i in restart_at and i != 0:
+                X = Q @ X  # type: ignore[union-attr]
+                R = X @ X.T
+                Q = None
+
+            Z = b * R + c * (R @ R)
+
+            if Q is None:
+                Q = Z + a * I
+            else:
+                Q = Q @ Z + a * Q
+
+            if i < len(coefficients) - 1 and (i + 1) not in restart_at:
+                RZ = R @ Z + a * R
+                R = Z @ RZ + a * RZ
+
+        X = Q @ X  # type: ignore[union-attr]
+
+    if transposed:
+        X = X.T
+
+    return X.to(original_dtype)
 
 
 class Muon(torch.optim.Optimizer):
@@ -156,13 +270,125 @@ class Muon(torch.optim.Optimizer):
                     updates_flat[curr : curr + p.numel()] = g.reshape(-1)
                 curr += p.numel()
 
-            if distributed:
+            if distributed and world_size > 1:
                 dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
 
             curr = 0
             for p in params:
                 g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
                 p.add_(g, alpha=-lr)
+                curr += p.numel()
+
+        return loss
+
+
+class MuonGNS(torch.optim.Optimizer):
+    """Muon optimizer using Gram Newton-Schulz orthogonalization.
+
+    Drop-in replacement for Muon that uses GNS (iterating on the Gram matrix
+    XX^T) instead of standard Newton-Schulz. Follows the GNS reference:
+    https://github.com/Dao-AILab/gram-newton-schulz
+
+    Key differences from standard Muon:
+    - Uses per-step tuned coefficients instead of a single (a,b,c) triple
+    - Iterates on the smaller Gram matrix for non-square weight matrices
+    - Uses fp16 for the NS iteration (matching GNS reference)
+    - LR scaling follows 'rms_norm' convention: 0.2 * sqrt(max(fan_out, fan_in))
+    - Supports weight decay (decoupled, applied after the update)
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float,
+        momentum: float,
+        nesterov: bool = True,
+        weight_decay: float = 0.0,
+        ns_coefficients: list[tuple[float, float, float]] | None = None,
+        ns_restart_at: list[int] | None = None,
+        adjust_lr: str = "rms_norm",
+    ):
+        if ns_coefficients is None:
+            ns_coefficients = YOU_COEFFICIENTS
+        if ns_restart_at is None:
+            ns_restart_at = [2]
+        defaults = dict(
+            lr=lr,
+            momentum=momentum,
+            nesterov=nesterov,
+            weight_decay=weight_decay,
+            ns_coefficients=ns_coefficients,
+            ns_restart_at=ns_restart_at,
+            adjust_lr=adjust_lr,
+        )
+        super().__init__(params, defaults)
+
+    @staticmethod
+    def _adjust_lr(lr: float, shape: tuple[int, ...], method: str) -> float:
+        fan_out, fan_in = shape[0], shape[1]
+        if method == "rms_norm":
+            return lr * 0.2 * math.sqrt(max(fan_out, fan_in))
+        elif method == "spectral_norm":
+            return lr * math.sqrt(fan_out / fan_in)
+        return lr
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        distributed = dist.is_available() and dist.is_initialized()
+        world_size = dist.get_world_size() if distributed else 1
+        rank = dist.get_rank() if distributed else 0
+
+        for group in self.param_groups:
+            params = group["params"]
+            if not params:
+                continue
+            lr = group["lr"]
+            momentum = group["momentum"]
+            nesterov = group["nesterov"]
+            weight_decay = group["weight_decay"]
+            coefficients = group["ns_coefficients"]
+            restart_at = group["ns_restart_at"]
+            adjust_lr_method = group["adjust_lr"]
+
+            total_params = sum(int(p.numel()) for p in params)
+            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
+
+            curr = 0
+            for i, p in enumerate(params):
+                if i % world_size == rank and p.grad is not None:
+                    g = p.grad
+                    state = self.state[p]
+                    if "momentum_buffer" not in state:
+                        state["momentum_buffer"] = torch.zeros_like(g)
+                    buf = state["momentum_buffer"]
+                    buf.mul_(momentum).add_(g)
+                    if nesterov:
+                        g = g.add(buf, alpha=momentum)
+                    # Gram Newton-Schulz orthogonalization
+                    g = zeropower_via_gram_newton_schulz(
+                        g, coefficients=coefficients, restart_at=restart_at
+                    )
+                    # LR adjustment per-shape (following GNS reference)
+                    adjusted_lr = self._adjust_lr(lr, g.shape, adjust_lr_method)
+                    g = g * adjusted_lr
+                    updates_flat[curr : curr + p.numel()] = g.reshape(-1).to(torch.bfloat16)
+                curr += p.numel()
+
+            if distributed and world_size > 1:
+                dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
+
+            curr = 0
+            for p in params:
+                g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
+                # Decoupled weight decay (applied at base_lr, not adjusted lr)
+                if weight_decay > 0:
+                    p.mul_(1 - lr * weight_decay)
+                p.add_(g, alpha=-1.0)
                 curr += p.numel()
 
         return loss
@@ -266,7 +492,7 @@ def eval_val(
             token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
             val_byte_count += token_bytes.to(torch.float64).sum()
 
-    if dist.is_available() and dist.is_initialized():
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
         dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
         dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
@@ -730,10 +956,12 @@ class GPT(nn.Module):
 
 def main() -> None:
     global zeropower_via_newtonschulz5
+    global zeropower_via_gram_newton_schulz
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    zeropower_via_gram_newton_schulz = torch.compile(zeropower_via_gram_newton_schulz)
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -754,8 +982,9 @@ def main() -> None:
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)
     if distributed:
-        dist.init_process_group(backend="nccl", device_id=device)
-        dist.barrier()
+        dist.init_process_group(backend="nccl")
+        if world_size > 1:
+            dist.barrier()
     master_process = rank == 0
 
     # Fast math knobs
@@ -841,7 +1070,7 @@ def main() -> None:
             module.float()
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
-    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed and world_size > 1 else compiled_model
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
@@ -868,12 +1097,32 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
-    optimizer_muon = Muon(
-        matrix_params,
-        lr=args.matrix_lr,
-        momentum=args.muon_momentum,
-        backend_steps=args.muon_backend_steps,
-    )
+    # Select Muon variant based on MUON_NS_ALGORITHM env var
+    use_gns = args.muon_ns_algorithm == "gram"
+    if use_gns:
+        gns_coeff_name = args.muon_gns_coefficients
+        gns_coefficients = GNS_COEFFICIENT_PRESETS.get(gns_coeff_name)
+        if gns_coefficients is None:
+            raise ValueError(
+                f"Unknown MUON_GNS_COEFFICIENTS={gns_coeff_name!r}, "
+                f"choices: {list(GNS_COEFFICIENT_PRESETS.keys())}"
+            )
+        gns_adjust = args.muon_gns_adjust_lr if args.muon_gns_adjust_lr != "none" else "none"
+        optimizer_muon = MuonGNS(
+            matrix_params,
+            lr=args.matrix_lr,
+            momentum=args.muon_momentum,
+            weight_decay=args.muon_gns_weight_decay,
+            ns_coefficients=gns_coefficients,
+            adjust_lr=gns_adjust,
+        )
+    else:
+        optimizer_muon = Muon(
+            matrix_params,
+            lr=args.matrix_lr,
+            momentum=args.muon_momentum,
+            backend_steps=args.muon_backend_steps,
+        )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
     optimizer_scalar = torch.optim.Adam(
@@ -908,6 +1157,13 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    if use_gns:
+        log0(
+            f"muon_ns:gram_newton_schulz coefficients:{args.muon_gns_coefficients} "
+            f"adjust_lr:{args.muon_gns_adjust_lr} weight_decay:{args.muon_gns_weight_decay}"
+        )
+    else:
+        log0(f"muon_ns:standard backend_steps:{args.muon_backend_steps}")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1047,7 +1303,7 @@ def main() -> None:
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
-        if distributed and max_wallclock_ms is not None:
+        if distributed and world_size > 1 and max_wallclock_ms is not None:
             reached_cap_tensor = torch.tensor(int(reached_cap), device=device)
             dist.all_reduce(reached_cap_tensor, op=dist.ReduceOp.MAX)
             reached_cap = bool(reached_cap_tensor.item())
@@ -1091,7 +1347,7 @@ def main() -> None:
         )
         log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
 
-    if distributed:
+    if distributed and world_size > 1:
         dist.barrier()
     with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()

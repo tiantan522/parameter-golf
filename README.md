@@ -43,8 +43,41 @@ VOCAB_SIZE=1024 \
 torchrun --standalone --nproc_per_node=8 train_gpt.py
 ```
 
-> Expected result: val BPB ≈ 1.22–1.23 on 8×A100 (vs. ~1.2244 on 8×H100).  
-> Exact numbers will be updated once the baseline run completes.
+> Baseline result: val BPB ≈ 1.2378 on 8×A100 (standard Muon, dim=512, 9L, mlp=2x).
+
+### Gram Newton-Schulz (GNS) Muon Experiments
+
+Integrated [Gram Newton-Schulz](https://github.com/Dao-AILab/gram-newton-schulz) from Tri Dao's lab as an alternative orthogonalization backend for the Muon optimizer. GNS uses per-step tuned coefficients and iterates on the smaller Gram matrix XX^T for non-square weight matrices.
+
+**Key findings:**
+- Per-step tuned coefficients (YOU/Polar Express) match standard Muon quality at the baseline model size.
+- `rms_norm` LR adjustment and `weight_decay=0.1` hurt quality at this scale, but WD dramatically compresses the artifact (~11.3M vs 15.8M).
+- WD compression creates headroom to fit a **larger model** in the 16MB budget and leverage GNS for updating larger non-square matrices more efficiently.
+
+**Hardware note:** GNS speed benefits are limited on A100 (SM80) because the custom symmetric GEMM kernels from the [GNS repo](https://github.com/Dao-AILab/gram-newton-schulz) require H100/Blackwell (SM90+). Our implementation uses pure PyTorch matmuls instead. On H100s with the `quack-kernels` package, GNS can achieve up to 2× speedup on the Newton-Schulz portion, especially for larger non-square matrices (e.g., MLP weights at 3-4× or more expansion). The quality benefits from per-step tuned coefficients are hardware-independent.
+
+#### Best Result: GNS + Larger Model (MLP=4x + WD)
+
+Leveraging WD compression to fit a 55% bigger model (26.5M params vs 17.1M):
+
+| Config | val_bpb | Artifact | Δ vs baseline |
+|---|---|---|---|
+| Standard Muon (512, 9L, mlp=2x) | 1.2378 | ~15.85M | — |
+| **GNS YOU + MLP=4x + WD=0.1** | **1.2269** | **15.77M** | **−0.0109** ✅ |
+
+**Best command:**
+```bash
+NCCL_NET_PLUGIN=none \
+  MODEL_DIM=512 NUM_LAYERS=9 MLP_MULT=4 \
+  MUON_NS_ALGORITHM=gram \
+  RUN_ID=gns_mlp4x_9L_wd01 \
+  DATA_PATH=./data/datasets/fineweb10B_sp1024/ \
+  TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model \
+  VOCAB_SIZE=1024 \
+  torchrun --standalone --nproc_per_node=8 train_gpt.py
+```
+
+GNS defaults (when `MUON_NS_ALGORITHM=gram`): YOU coefficients, `adjust_lr=none`, `weight_decay=0.1`.
 
 ---
 
