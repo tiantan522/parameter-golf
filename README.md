@@ -146,6 +146,71 @@ MTP is a technique that works at large scale (120B+ params in Nemotron/DeepSeek)
 | 3 | + Depth Recurrence (layers 3,4) | **1.2232** | **−0.0146** |
 | 4 | + MTP depth=1 (reverted — negative) | 1.2303 | +0.0034 ❌ |
 
+
+### NCA Pre-Pre-Training (PPT) — Exploratory Research
+
+Implemented Neural Cellular Automata Pre-Pre-Training from ["Training Language Models via Neural Cellular Automata"](https://arxiv.org/abs/2603.10055) ([code](https://github.com/danihyunlee/nca-pre-pretraining)). The hypothesis: training transformer blocks on structured non-textual dynamics (NCA grid simulations) before language data may provide a better weight initialization than random init, analogous to how vision pre-training helps NLP in some settings.
+
+**Pipeline:** Generate NCA simulations (JAX) → Tokenize grids into sequences → Train transformer blocks with next-token prediction → Transfer block weights to text model (re-init embeddings) → Normal text training.
+
+**Implementation (`train_gpt_ppt.py`):**
+- NCA dynamics: Random 3-layer conv rules (3×3→4ch, 1×1→16ch, ReLU, 1×1→d_state), wrap-around padding on all dimensions, categorical sampling with identity bias + temperature
+- Tokenizer: 2×2 patches → base-10 encoding (vocab=10002), start/end tokens per timestep, min_grid masking
+- Training: Adam optimizer, CrossEntropyLoss(ignore_index=-100), cosine LR decay with warmup
+- Transfer: Extract blocks/final_norm/skip_weights → create fresh GPT → load_state_dict(strict=False)
+- Federated PPT: 8 GPUs train independently on different NCA seeds, weights averaged via all_reduce
+- Gzip complexity filter: Keeps only simulations with "interesting" compression ratios
+- Data regeneration: Fresh NCA rules/sims every ~epoch to avoid overfitting
+- Fresh model after PPT: Critical for torch.compile graph caching (in-place module swap causes 36% slowdown)
+
+**Results:**
+
+| Config | val_bpb | steps | step_avg | Δ vs GNS+MLP4x |
+|--------|---------|-------|----------|-----------------|
+| GNS + MLP=4x (no PPT, baseline) | 1.2269 | ~5450 | ~110ms | — |
+| GNS + MLP=4x + **PPT 5000 iters, 8K sims** | **1.2451** | 5374 | 111.67ms | **+0.0182** ❌ |
+
+**Command:**
+```bash
+NCCL_NET_PLUGIN=none MLP_MULT=4 PPT_ENABLE=1 PPT_ITERATIONS=5000 PPT_NUM_SIMS=8000 \
+  MUON_NS_ALGORITHM=gram RUN_ID=gns_mlp4x_ppt_5k_wd01 \
+  DATA_PATH=./data/datasets/fineweb10B_sp1024/ \
+  TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model VOCAB_SIZE=1024 \
+  torchrun --standalone --nproc_per_node=8 train_gpt_ppt.py
+```
+
+**Analysis — Why PPT doesn't help (yet):**
+
+1. **Scale mismatch**: The original paper demonstrates PPT benefits on a 1.3B parameter model trained for 50K steps across 1.6M unique NCA trajectories. Our model is ~26M parameters — PPT may require a minimum model capacity threshold to benefit from structured pre-initialization.
+
+**What could be explored next:**
+- **Curriculum**: Start with very simple NCA rules (low temperature → nearly deterministic) to teach basic sequence structure
+- **Hybrid pre-training data**: Mix NCA sequences with random text-like sequences to keep the init closer to the text distribution
+- **Larger model**: If we scale to 100M+ params (e.g., using more aggressive quantization for the artifact), PPT benefits may emerge
+- **Different structured data**: Instead of NCA, try Game of Life, elementary cellular automata, or synthetic grammar sequences that are closer to natural language structure
+- **Partial transfer**: Only transfer attention weights (not MLP), since attention patterns for sequential dependencies might transfer better than MLP activations
+
+**Implementation Comparison vs Official NCA Repo:**
+
+Our `train_gpt_ppt.py` was carefully compared line-by-line against the [official repo](https://github.com/danihyunlee/nca-pre-pretraining) (`utils/nca.py`, `utils/tokenizers.py`, `src/nca_ppt.py`, `utils/util.py`). Key verification points:
+
+| Component | Official | Ours | Status |
+|-----------|----------|------|--------|
+| NCA padding | `jnp.pad(x, pad_width=1, mode='wrap')` — pads ALL dims (H+2,W+2,C+2) | `jnp.pad(state_oh, ((1,1),(1,1),(1,1)), mode='wrap')` | ✅ Match |
+| Conv architecture | `Conv(→4, 3×3)` → `Conv(→16, 1×1)` → ReLU → `Conv(→d_state, 1×1)` | Same (kernel shapes: `(3,3,d_state+2,4)`, `(1,1,4,16)`, `(1,1,16,d_state)`) | ✅ Match |
+| init_state | `random_normal(rng, (n_groups, d_state))` broadcast H×W → categorical | `random_normal(rng, (d_state,))` broadcast (grid,grid,d_state) → categorical | ✅ Match (n_groups=1) |
+| step_state | `(logits + state_oh * identity_bias) / temperature` → categorical | Same with `max(temperature, 1e-10)` safety | ✅ Match |
+| Tokenizer | `NCA_Tokenizer.encode_task`: patches → base-N → start/end tokens | Vectorized NumPy reimplementation with identical logic | ✅ Match |
+| Target masking | `NCADataset.__getitem__`: target=seq, mask first min_grid timesteps, shift by 1 | Same: `target=seq.copy()`, mask, then `inp=seq[:-1]`, `tgt=target[1:]` | ✅ Match |
+| LR schedule | `get_lr_scheduler`: linear warmup → cosine decay | Same formula | ✅ Match |
+| Loss | `CrossEntropyLoss()` (default ignore_index=-100) | `F.cross_entropy(..., ignore_index=-100)` | ✅ Match |
+| Conv bias | Flax default (bias_init=zeros, never updated) | No bias (equivalent — bias stays 0 since rules aren't trained) | ✅ Equivalent |
+| Kernel init | Flax lecun_normal: std≈1/√(fan_in) | `N(0, 0.25)` (std=0.5) — slightly larger random weights | ⚠️ Minor diff (acceptable for random rules) |
+| Adam betas | Default (0.9, 0.999) | (0.9, 0.95) — matches our text phase | ⚠️ Minor diff (intentional) |
+
+This remains an interesting research direction — the idea that non-textual structured dynamics can bootstrap language model weights is compelling, but our current model scale may be too small to benefit.
+
+---
 ---
 
 **OpenAI Model Craft Challenge: Parameter Golf** is a challenge to train the best language model that fits in a 16MB artifact and trains in under 10 minutes on 8xH100s, evaluated by compression on the FineWeb validation set (tokenizer-agnostic, bits per byte).
